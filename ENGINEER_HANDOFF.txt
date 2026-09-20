@@ -1,0 +1,534 @@
+ENGINEER HANDOFF
+HackMIT 2026 project-space prototype
+Now one repo: frontend/ (Next.js) and backend/ (Python pipeline).
+
+Repos (historical local paths; this GitHub repo folds them together):
+  frontend  /Users/cadenahama/HackMit2026/hackmit2026          (Next.js 16 app)
+  backend   /Users/cadenahama/HackMit2026/hackmit2026backend   (Python scrape, graph, model, Elastic ingest)
+
+This note is a full account of what was built in this workstream, why those
+choices were made, how the methods work, which files changed, and what a
+downstream engineer should and should not copy.
+
+========================================================================
+1. WHAT THIS IS
+========================================================================
+
+A research-grade prototype for three product jobs:
+
+  A. Show every public HackMIT / Blueprint project in a 3D similarity map,
+     with connections that are evidenced from writeups, not from track
+     tags or popular sponsor prizes.
+
+  B. Let someone paste a project description and retrieve similar judged
+     projects from HackMIT 2025, plus an honest score of how those
+     analogues actually placed.
+
+  C. Score live HackMIT 2026 gallery cards against 2025 ranks: expected
+     performance, per official 2026 track when Plume has one, with
+     analogue reasoning. This is a prior, not a results sheet.
+
+There is also a one-button "Pull live" control so 2026 metadata can be
+re-fetched from Plume, the graph rebuilt, the forecast rebuilt, and
+Elasticsearch reindexed without running four CLI commands.
+
+This started as an interview/survey app. It was deliberately pivoted to
+public Plume gallery data so we could do Palantir-style entity viz and
+a prediction track without storing registration-only PII.
+
+========================================================================
+2. PRODUCT SURFACES (frontend)
+========================================================================
+
+Dev server is Next.js 16, typically http://localhost:3001 (3000 if free).
+
+  GET /              3D WebGL map (react-three-fiber). Home page.
+  GET /forecast      2026 ranking prior, per-track filters, analogue
+                     drill-down per project.
+  GET /match         Paste a writeup; retrieve judged 2025 neighbours
+                     via Elasticsearch (file fallback).
+  GET /data          Old interview form. Not the product anymore.
+                     Keep only if the larger app still needs interviews.
+
+Header on map / forecast / match:
+  Map | 2026 forecast | Try a writeup | Pull live | ES chip (map only)
+
+Pull live:
+  POST /api/refresh  spawns backend/refresh.py
+  GET  /api/refresh  polls data/refresh_status.json
+  On success the UI fires a window event "hackmit:refreshed" so the map
+  refetches GET /api/map and the forecast refetches GET /api/forecast.
+
+Other APIs:
+  GET  /api/map      Elastic hackmit-map, else public/map/coords.json
+  GET  /api/forecast no-store wrapper around public/forecast/forecast.json
+  POST /api/match    Elastic multi_match on writeup/description among
+                     hack-2025 ranked points; Jaccard fallback on the
+                     forecast's judged_2025 list.
+
+========================================================================
+3. ARCHITECTURE AND WHERE DATA LIVES
+========================================================================
+
+Two stores on purpose. A HackMIT track requires using Elastic software;
+everything else stays out of Elastic so the product is not locked in.
+
+  Elasticsearch (Elastic Cloud, index hackmit-map)
+    Snapshot of the 3D map only: points, evidenced edges, theme islands,
+    and attached writeup text for retrieval. Rebuilt by deleting and
+    recreating the index (not a partial upsert). Last live rebuild
+    indexed 1202 docs (722 points + 462 edges + 17 clusters + 1 meta).
+
+  Local JSON lake (backend/data/, gitignored)
+    projects.json   full entity records
+    features.json   flat rows for modeling
+    graph.json      nodes + evidenced edges (the rigorous object)
+    coords.json     compact 3D client snapshot
+    forecast.json   2026 analogue + ridge scores
+    .details_cache.json   raw Plume detail payloads (must be busted
+                          on live 2026 refresh or writeups stay stale)
+
+  Frontend static copies (for file fallback / git-friendly snapshots)
+    public/map/coords.json, public/map/graph.json
+    public/forecast/forecast.json
+
+  Supabase
+    Interviews and any non-map product data. Optional gallery table
+    (backend/schema.sql) if you want the lake in SQL. Live refresh
+    currently skips Supabase on purpose so a missing service-role key
+    cannot fail the map rebuild.
+
+Do not put the whole product in Elastic. Do not use Elastic to compute
+UMAP or kNN. It is a document store for the already-built map.
+
+Env (never commit real keys):
+
+  backend/.env
+    ELASTIC_URL, ELASTIC_API_KEY, ELASTIC_INDEX=hackmit-map
+    SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (optional)
+
+  frontend/.env.local
+    same Elastic trio (server-side only; do not NEXT_PUBLIC_ the API key)
+    NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY
+    optional BACKEND_DIR, BACKEND_PYTHON, REFRESH_SECRET
+
+========================================================================
+4. DATA ACQUISITION (PLUME)
+========================================================================
+
+Public, unauthenticated. Base: https://plume.hackmit.org
+
+  GET /api/v3/projects/gallery
+      paginated discovery (hackathon_id, page, items_per_page=24)
+
+  GET /api/v3/projects/{id}
+      full record: writeup metadata, rank, score, categories,
+      sponsorChallenges, hackers[], prizeWinners
+
+Hackathons stored:
+  bp-2025, hack-2025, bp-2026, hack-2026
+
+What we persist (see DATA.md):
+  writeup fields, track, categories, sponsor challenges applied to,
+  prize_winners / is_winner, rank, score, team_size, schools,
+  members (names often blank unauthenticated; org still comes through),
+  code/video links, table location.
+
+What we NEVER persist (registration/ops riding on the detail payload):
+  finaid, travelStatus, travelSubmitted, travelDenialReasons,
+  liabilityDocusignCompleted, mediaDocusignCompleted, tshirtSize, email.
+
+Rank on Plume is per-track and 0-indexed. Score is often tied at the
+top of a track; we model rank, not raw score.
+
+hack-2025: ~319 projects, 250 judged with rank/score. prize_winners and
+is_winner are empty in the public API, so there is no trophy label.
+hack-2026: live target. Ranks still null until ceremony. Tracks were
+all "NO TRACK" early; after the 2026-09-20 morning pull they were
+mostly filled (Education, General, Healthcare, Entertainment,
+Sustainability, Beginner) with a remainder still unlabeled.
+
+Blueprint is a different population (high school). Ranks exist for
+bp-2025. We store Blueprint on the map for completeness. We do not mix
+it into the HackMIT ranker.
+
+Politeness: ~0.6s between gallery pages, ~0.25s between detail GETs,
+retries on 5xx. User-Agent identifies the research client.
+
+Critical cache bug that was fixed:
+  Detail payloads were cached forever. Live 2026 writeups never updated
+  even if you re-ran sync.py. --live / --refresh-details now drops
+  cached details for the IDs being scraped. --live scrapes only
+  hack-2026 and MERGES into the existing lake so 2025 ranks are not
+  wiped. Default merge keeps any hackathon you did not just scrape.
+
+Last successful live pull (UTC 2026-09-20 ~12:06):
+  lake 722 projects (319 + 298 + 59 + 46)
+  hack-2026: 298 cards, 144 with description, 126 writeups >= 200 chars
+  official 2026 tracks: Education 45, General 41, Healthcare 38,
+    Entertainment 25, Sustainability 25, Beginner 20, NO TRACK 104
+  2026 ranks: still 0
+
+========================================================================
+5. SIMILARITY GRAPH — METHOD AND REASONING
+========================================================================
+
+Contract: backend/SIMILARITY.md. Implementation: similarity.py.
+This is the most important methodological piece. Do not "improve" it
+by adding track or Anthropic as an edge.
+
+Why tags are not edges (measured on the first 660-project scrape,
+425 content-eligible writeups, 90,100 pairs):
+
+  random pair mean cosine                 0.042
+  same track                              0.051   (+0.009, tiny)
+  share only a top-5 sponsor              0.052   (Anthropic x144 etc.)
+  share a rare (non-top-5) sponsor        0.074   (modest, supporting)
+  corr(cosine, sponsor Jaccard | share)   0.18    tags are not a proxy
+
+Connecting every Beginner to every Beginner would have drawn ~1,891
+fake edges and drowned the actual "two clinical knowledge-graph
+projects" connections. Popular sponsor tags have the same failure mode.
+
+Representation:
+  TF-IDF unigrams+bigrams on writeup fields ONLY
+  (description, what_it_does, inspiration, how_we_built_it,
+   challenges_we_ran_into, accomplishments).
+  Track names and sponsor titles are not in the vector.
+  Heavy boilerplate stoplist (app, built, hackathon, llm, react, …).
+
+An edge exists only when ALL of:
+  1. Both writeups >= 200 characters.
+  2. Mutual 10-NN in TF-IDF cosine.
+  3. cosine >= 0.14  (~corpus p98; random p50 ~0.036).
+  4. Signature-term evidence: each project has a 25-term signature
+     after dropping boilerplate and terms in >20% of docs. Accept if
+       >= 4 shared terms, OR
+       >= 3 and at least one is rare (df<=15) or a bigram, OR
+       >= 2 rare terms.
+     This stops "every game-shaped writeup" linking on {game, fun}.
+
+Weight, only after an edge exists (track is absent):
+  0.72 * scaled cosine (0.14 -> 0.45)
+  + 0.22 * min(1, n_shared_signature_terms / 6)
+  + 0.06 * min(1, sum IDF(rare shared sponsors) / 12)
+
+Rare-sponsor IDF is a 6% tie-breaker (Mentra+Suno can support; Anthropic
+cannot create or carry an edge).
+
+After the morning rebuild: 521 content-eligible / 722, 462 edges,
+34 components, 189 eligible isolates, 17 theme islands covering 138
+projects. Lines are the rigorous object. Two dots can sit near each
+other in 3D without a line if they failed evidence. That is intended.
+
+========================================================================
+6. 3D MAP LAYOUT
+========================================================================
+
+Eligible writeups: TF-IDF -> 64-d truncated SVD -> UMAP 3D
+  n_neighbors=12, min_dist=0.2, metric=cosine.
+
+PCA was tried and rejected as the primary layout: 3D kNN overlap with
+TF-IDF neighbors ~0.17 (PCA) vs ~0.44 (UMAP). Evidenced edges sit at
+~0.22x random distance in UMAP vs ~0.50x in PCA. PCA is fallback only.
+
+Thin / empty writeups (most of early 2026) are NOT mixed into UMAP.
+They are parked on a sphere of radius 2.4 and hidden by default
+("Hide thin"). They must not warp the content map.
+
+Color is not a forced partition of the cloud.
+  Rejected: KMeans on UMAP (a 61-project "study" blob had intra-cosine
+  0.037, indistinguishable from a random pair).
+  Used: average-linkage islands on writeup cosine. Keep an island only
+  if n>=5 AND mean pairwise cosine >= 0.14 (same floor as an edge).
+  Unlabeled projects stay gray: nearby in UMAP is a neighborhood, not
+  a category. Island groups are translated as a rigid set so themes
+  do not sit on top of each other.
+
+UI (ProjectMap.tsx):
+  WebGL via @react-three/fiber + drei, three r186.
+  Filters: hackathon year, theme vs track color, inspect vs all lines,
+  hide thin, search (unique name auto-selects; Recenter frames name
+  hits, not a 1-hop snowball).
+  Yellow torus on a point = is_winner (almost none for hack-2025).
+  Cosine on a line = TF-IDF writeup cosine of that evidenced pair.
+
+Canvas layout bugs that were already fixed and should stay fixed:
+  full viewport height (h-screen / 100dvh), single OrbitControls with
+  target={orbitTarget}, Recenter uses lookAt rather than a second
+  controls instance, compact header z-20, drei Html zIndexRange so
+  labels do not eat the toolbar, meshBasicMaterial.
+
+========================================================================
+7. PREDICTION / FORECAST — METHOD AND HONESTY
+========================================================================
+
+File: backend/predict.py. UI: /forecast and /match.
+
+This is not an oracle. Public writeups only weakly predict within-track
+rank. The product is analogue retrieval plus a modest ridge, with the
+uncertainty printed on the page.
+
+Labels:
+  Train ONLY on hack-2025 projects with a public rank (n=250).
+  Within-track percentile of 0-indexed rank (1.0 = first in that track).
+  Never pool tracks. is_beginner correlates with raw score because
+  larger tracks dilute pairwise win-rate (Beginner vs score was about
+  -0.711). That is leakage, not a feature.
+  Blueprint is domain shift; not mixed into the scorer.
+  hack-2025 prize_winners is empty; there is no trophy classifier.
+
+Features (leak-safe):
+  TF-IDF on 2025 judged writeups only (vectorizer and LSA basis do not
+  see 2026). 32-d truncated SVD. No 2026 leakage into the basis.
+
+Two scores, shown separately:
+
+  1. Analogue kNN (k=12, cosine in LSA space)
+     Similarity-weighted 2025 within-track percentile of neighbours,
+     with an 80% bootstrap interval.
+     Finalist-likeness = weighted share of neighbours who finished
+     top-10 in their 2025 track.
+     Track inference for cards still labeled NO TRACK: majority vote
+     of those neighbours. If Plume now lists an official 2026 track,
+     that listed track wins and is stored as track_source=gallery.
+     Neighbour vote is kept as inferred_track for the writeup.
+
+  2. Ridge on the 32-d LSA (alpha=2)
+     Predicted percentile vs a 2025 track. Used to ORDER the 2026 list.
+     Held-out 5-fold, stratified by official 2025 track:
+       chance NDCG@10              0.514
+       ridge-LSA NDCG@10           0.586
+       chance top-10 overlap       17%
+       ridge top-10 overlap        27%
+     Real lift. Small lift. Do not treat the 2026 order as a result.
+
+Refusal:
+  Writeup < 80 chars  -> confidence none, no percentile.
+  Writeup < 200 chars -> not forecastable on the main list
+                         (Hide empty writeups is on by default).
+  After the morning pull: 126 / 298 forecastable.
+
+Match page:
+  Live query goes to Elasticsearch multi_match over writeup^3,
+  description^2, name, signature_terms, filtered to hack-2025 with a
+  rank. Same analogue / finalist reporting. File fallback is Jaccard
+  on judged_2025 snippets if Elastic is down.
+
+Reasoning shown per 2026 card:
+  registered gallery track if present
+  neighbour track vote
+  ridge percentile
+  analogue percentile + bootstrap
+  finalist-likeness + interval
+  closest strong analogue (place of N in track, cosine)
+  note if the writeup is short relative to 2025 top finishes
+
+========================================================================
+8. LIVE REFRESH PIPELINE
+========================================================================
+
+One command, also the web button.
+
+  python refresh.py            # hack-2026 only, cache-busted, merge
+  python refresh.py --all      # every stored hackathon (slow)
+  python refresh.py --status   # print data/refresh_status.json
+
+Order inside refresh.py:
+  1. sync.py --live
+  2. similarity.py --copy-public <frontend>/public/map --no-elastic
+  3. predict.py --copy-public <frontend>/public/forecast
+  4. elastic_map.py   (try/except: scrape+graph+forecast still succeed
+                       if Elastic is down; elastic_error is recorded)
+
+Web path:
+  Pull live -> POST /api/refresh -> spawn
+    <backend>/.venv/bin/python -u refresh.py
+    cwd = sibling backend/
+    detached, stdio ignored, status file is the progress channel
+  Button label becomes "Updating scrape|graph|forecast|elastic…"
+  On running -> ok, window event hackmit:refreshed reloads map + forecast.
+
+Refresh is allowed in development without a secret. In production it
+refuses unless REFRESH_SECRET is set (send header x-refresh-secret).
+Two clicks while running return 409.
+
+Runtime is about two minutes with 298 detail fetches. Do not fire this
+on a timer; the button exists specifically to keep complexity down.
+
+========================================================================
+9. ELASTICSEARCH DETAILS
+========================================================================
+
+Index: hackmit-map
+Client: elasticsearch Python 8.x talking to Elastic Cloud 9.x is what
+is running today. requirements.txt pins elasticsearch>=8.15,<9.
+
+Documents:
+  kind=meta     built_at, method, count
+  kind=point    project fields, x y z, writeup (up to 2000 chars),
+                description, rank, score, cluster_*, signature_terms
+  kind=edge     source, target, weight, cosine, shared_terms, evidence
+  kind=cluster  id, label, size, centroid
+
+upload_coords deletes the index and recreates mappings, then bulk
+indexes. attach_writeups joins coords to projects.json so match
+retrieval has real writeup text, not just the 400-char description.
+
+Frontend searchMapIndex does POST {index}/_search size 2500 match_all
+with ApiKey auth. Map GET prefers Elastic when ELASTIC_URL is set.
+
+========================================================================
+10. FILES — BACKEND (backend/)
+========================================================================
+
+ADDED
+  DATA.md              field dictionary, dropped PII, lake layers
+  SIMILARITY.md        empirical contract for edges (do not skip)
+  API.md               Plume route notes from the frontend bundle
+  schema.sql           optional Supabase gallery table
+  similarity.py        graph + UMAP + island labels + coords export
+  embed_coords.py      earlier coord helper; similarity.py is canonical
+  predict.py           analogue kNN + ridge LSA + forecast.json
+  elastic_map.py       Elastic ingest for the map snapshot
+  refresh.py           scrape -> graph -> forecast -> Elastic
+  data/*               gitignored generated lake (do not commit secrets)
+
+EDITED
+  sync.py              gallery+detail scrape; --live, --refresh-details,
+                       merge-by-default, HACKER_DROP, feature_row
+  requirements.txt     requests, supabase, dotenv, scikit-learn,
+                       umap-learn, elasticsearch
+  .env.example         Elastic + optional Supabase
+  .gitignore           .venv, .env, data/, pyc
+  README.md            pipeline, refresh.py, Elastic vs Supabase
+
+Python 3.9 venv at backend/.venv. umap-learn is required.
+
+========================================================================
+11. FILES — FRONTEND (frontend/)
+========================================================================
+
+ADDED
+  src/components/AppNav.tsx
+  src/components/ProjectMap.tsx
+  src/components/RefreshLive.tsx
+  src/lib/elastic.ts
+  src/lib/forecast.ts
+  src/lib/backend.ts          paths to sibling backend / venv python
+  src/app/api/map/route.ts
+  src/app/api/match/route.ts
+  src/app/api/forecast/route.ts
+  src/app/api/refresh/route.ts
+  src/app/forecast/page.tsx
+  src/app/match/page.tsx
+  public/map/coords.json      generated; large
+  public/map/graph.json       generated; large
+  public/forecast/forecast.json  generated; large
+  ENGINEER_HANDOFF.txt        this file
+
+EDITED
+  src/app/page.tsx            home is the map
+  src/app/layout.tsx
+  src/app/globals.css         full-height dark shell
+  src/app/data/page.tsx       leftover interview route
+  src/components/InterviewForm.tsx   leftover
+  src/app/actions/interviews.ts
+  src/lib/types.ts
+  src/lib/supabase.ts
+  package.json                three, r3f, drei, supabase
+  .env.example
+  README.md
+
+AGENTS.md / CLAUDE.md are Next 16 agent notes from `next dev`. This is
+not the Next.js of older training data. Read node_modules/next/dist/docs
+before changing App Router APIs.
+
+========================================================================
+12. HOW TO RUN
+========================================================================
+
+Backend:
+  cd backend
+  python3 -m venv .venv && source .venv/bin/activate
+  pip install -r requirements.txt
+  cp .env.example .env          # paste Elastic keys
+  python refresh.py             # or the four-step pipeline in README
+
+Frontend:
+  cd frontend
+  npm install
+  cp .env.example .env.local    # same Elastic keys, plus Supabase if used
+  npm run dev
+
+First Elastic load if you did not use refresh.py:
+  python similarity.py --copy-public ../frontend/public/map
+  python elastic_map.py
+
+========================================================================
+13. WHAT TO COPY INTO THE LARGER PRODUCT
+========================================================================
+
+Copy as-is (methods, not just code):
+  - Plume scrape + HACKER_DROP list. Do not start storing finaid/travel.
+  - Evidence rule for edges. Do not add track or top-5 sponsors as
+    reasons to draw a line. SIMILARITY.md is the contract.
+  - Train/score split: hack-2025 judged only, never pool tracks,
+    never mix Blueprint into the HackMIT ranker.
+  - Refusal to rank empty writeups.
+  - The NDCG numbers and the "not a results sheet" framing. Shipping
+    a leaderboard UI that hides the caveats would be a product bug.
+  - Elastic as map document store only; lake stays JSON or Supabase.
+  - Live refresh as a button, not a cron, unless you add locking and
+    rate limits against Plume.
+
+Replace or rewrite for production:
+  - Spawn-python-from-Next is a local-hackathon convenience. In a real
+    service, make refresh.py a worker (CLI, queue, or small FastAPI)
+    and have the app poll status. Do not expose unauthenticated POST
+    /api/refresh on a public host without REFRESH_SECRET.
+  - public/*.json snapshots are fine for demos; the live path is Elastic
+    + /api/forecast. Decide one source of truth.
+  - Interview form at /data is leftover. Delete or merge with your
+    existing interview product.
+  - Two git repos can stay, or become a monorepo. The frontend assumes
+    the backend is a sibling directory named backend unless
+    BACKEND_DIR is set.
+  - elasticsearch Python pin <9 vs Elastic Cloud 9.x: it works today;
+    bump the client when you productionize.
+  - Next.js 16 / React 19 / Tailwind 4. Do not assume Pages Router.
+
+When 2026 ranks land:
+  Re-run refresh.py. The same predict.py will still train on 2025
+  unless you change it; 2026 ranks become labels for a later year
+  model, not something to fit and then "predict" the same weekend.
+  If you want calibration against 2026 results after ceremony, that
+  is a new eval, not the current scorer.
+
+========================================================================
+14. HONEST LIMITATIONS (DO NOT DROP IN THE PARENT APP)
+========================================================================
+
+  Public text is a weak rank signal (NDCG@10 0.51 -> 0.59).
+  Analogues are the useful object; the ordered 2026 list is a prior.
+  hack-2025 has no public trophy flag.
+  104 / 298 of 2026 still have no official track; 172 are still too
+  thin to score.
+  Names are often blank without Plume auth; we did not log in.
+  UMAP is a view, not a proof of a theme. Islands are conservative
+  on purpose. Gray is not a category.
+  Cosine on a map line is writeup TF-IDF cosine, not "these teams
+  collaborated."
+  Yellow rings are is_winner, which is almost unused for 2025.
+
+========================================================================
+15. QUICK GLOSSARY FOR THE PARENT CODEBASE
+========================================================================
+
+  lake           projects.json, one row per public project
+  eligible       writeup >= 200 chars, allowed to have edges / sit in UMAP
+  evidenced edge mutual kNN + cosine floor + signature terms
+  island         average-linkage cluster that also clears the cosine floor
+  analogue       nearest judged 2025 writeups and how they placed
+  model          ridge on 32-d writeup LSA, 2025 ranks only
+  Pull live      scrape 2026 + rebuild graph + rebuild forecast + reindex ES

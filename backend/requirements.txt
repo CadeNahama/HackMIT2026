@@ -1,0 +1,6 @@
+requests>=2.32
+supabase>=2.10
+python-dotenv>=1.0
+scikit-learn>=1.5
+umap-learn>=0.5
+elasticsearch>=8.15,<9
